@@ -65,6 +65,49 @@ func TestGetWithTestContainers(t *testing.T) {
 	require.Equal(t, user, found)
 }
 
+func TestGetWithTestContainersConcurrent(t *testing.T) {
+	tests := []struct {
+		title string
+		user  *User
+	}{
+		{
+			"user Mike",
+			&User{
+				ID:   "0123456789ABCDEFGHJKMNPQRS",
+				Name: "Mike",
+				Age:  20,
+			},
+		},
+		{
+			"user Bob",
+			&User{
+				ID:   "1123456789ABCDEFGHJKMNPQRS",
+				Name: "Bob",
+				Age:  25,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.title, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			db, teardown := prepareContainer(ctx, t)
+			defer teardown()
+
+			// run
+			r := NewUserRepository(db)
+			err := r.Register(ctx, tt.user)
+			require.NoError(t, err)
+
+			found, err := r.Get(ctx, tt.user.ID)
+			require.NoError(t, err)
+
+			require.Equal(t, tt.user, found)
+		})
+	}
+}
+
 func prepareContainer(ctx context.Context, t *testing.T) (*sql.DB, func()) {
 	req := testcontainers.ContainerRequest{
 		Image: "mysql:8",
