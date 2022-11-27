@@ -3,6 +3,7 @@ package gosqltests
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/samber/lo"
@@ -62,6 +63,10 @@ func (r *userRepository) Get(ctx context.Context, id string) (*User, error) {
 		models.UserWhere.ID.EQ(string(id)),
 	).One(ctx, r.db)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("user was not found (id: %s): %w", id, err)
+		}
+
 		return nil, fmt.Errorf("failed to get user (id: %s): %w", id, err)
 	}
 

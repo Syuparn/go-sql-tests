@@ -210,6 +210,49 @@ func TestGetWithSQLMock(t *testing.T) {
 	}
 }
 
+func TestGetErrorWithSQLMock(t *testing.T) {
+	tests := []struct {
+		title       string
+		id          string
+		query       string
+		mockErr     error
+		expectedErr string
+	}{
+		{
+			"not found",
+			"0123456789ABCDEFGHJKMNPQRS",
+			"SELECT `user`.* FROM `user` WHERE (`user`.`id` = ?) LIMIT 1",
+			sql.ErrNoRows,
+			"user was not found (id: 0123456789ABCDEFGHJKMNPQRS): sql: no rows in result set",
+		},
+		{
+			"unexpected error",
+			"0123456789ABCDEFGHJKMNPQRS",
+			"SELECT `user`.* FROM `user` WHERE (`user`.`id` = ?) LIMIT 1",
+			fmt.Errorf("crashed unexpectedly!!!"),
+			"failed to get user (id: 0123456789ABCDEFGHJKMNPQRS): models: failed to execute a one query for user: bind failed to execute query: crashed unexpectedly!!!",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.title, func(t *testing.T) {
+			// mock
+			db, mock, teardown := prepareMockDB(t)
+			defer teardown()
+			mock.ExpectQuery(regexp.QuoteMeta(tt.query)).
+				WillReturnError(tt.mockErr)
+
+			// run
+			r := NewUserRepository(db)
+			_, err := r.Get(context.TODO(), tt.id)
+
+			// assert
+			require.Error(t, err)
+			require.EqualError(t, err, tt.expectedErr)
+		})
+	}
+}
+
 func prepareMockDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock, func()) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
