@@ -5,12 +5,18 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"net"
 	"path/filepath"
 	"regexp"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/docker/go-connections/nat"
+	sqle "github.com/dolthub/go-mysql-server"
+	"github.com/dolthub/go-mysql-server/memory"
+	"github.com/dolthub/go-mysql-server/server"
+	simsql "github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/information_schema"
 	"github.com/stretchr/testify/require"
 	testcontainers "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -215,4 +221,190 @@ func prepareMockDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock, func()) {
 	}
 
 	return db, mock, teardown
+}
+
+// test using go-mysql-server
+func TestGetWithGoMySQLServer(t *testing.T) {
+	tests := []struct {
+		title    string
+		id       string
+		prepare  func(*simsql.Context, *memory.Table)
+		expected *User
+	}{
+		{
+			"get a user",
+			"0123456789ABCDEFGHJKMNPQRS",
+			func(ctx *simsql.Context, table *memory.Table) {
+				_ = table.Insert(ctx, simsql.NewRow(
+					"0123456789ABCDEFGHJKMNPQRS",
+					"Mike",
+					int64(20),
+				))
+				_ = table.Insert(ctx, simsql.NewRow(
+					"1123456789ABCDEFGHJKMNPQRS",
+					"Bob",
+					int64(25),
+				))
+			},
+			&User{
+				ID:   "0123456789ABCDEFGHJKMNPQRS",
+				Name: "Mike",
+				Age:  20,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.title, func(t *testing.T) {
+			// simulator
+			table, teardown := prepareSimulator(t, 23306)
+			defer teardown()
+			tt.prepare(simsql.NewEmptyContext(), table)
+
+			// run
+			db, err := NewClient(23306)
+			require.NoError(t, err)
+			r := NewUserRepository(db)
+			actual, err := r.Get(context.TODO(), tt.id)
+
+			// assert
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+func TestGetWithGoMySQLServerConcurrent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		title    string
+		id       string
+		prepare  func(*simsql.Context, *memory.Table)
+		expected *User
+	}{
+		{
+			"get Mike",
+			"0123456789ABCDEFGHJKMNPQRS",
+			func(ctx *simsql.Context, table *memory.Table) {
+				_ = table.Insert(ctx, simsql.NewRow(
+					"0123456789ABCDEFGHJKMNPQRS",
+					"Mike",
+					int64(20),
+				))
+				_ = table.Insert(ctx, simsql.NewRow(
+					"1123456789ABCDEFGHJKMNPQRS",
+					"Bob",
+					int64(25),
+				))
+			},
+			&User{
+				ID:   "0123456789ABCDEFGHJKMNPQRS",
+				Name: "Mike",
+				Age:  20,
+			},
+		},
+		{
+			"get Bob",
+			"1123456789ABCDEFGHJKMNPQRS",
+			func(ctx *simsql.Context, table *memory.Table) {
+				_ = table.Insert(ctx, simsql.NewRow(
+					"0123456789ABCDEFGHJKMNPQRS",
+					"Mike",
+					int64(20),
+				))
+				_ = table.Insert(ctx, simsql.NewRow(
+					"1123456789ABCDEFGHJKMNPQRS",
+					"Bob",
+					int64(25),
+				))
+			},
+			&User{
+				ID:   "1123456789ABCDEFGHJKMNPQRS",
+				Name: "Bob",
+				Age:  25,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.title, func(t *testing.T) {
+			t.Parallel()
+
+			// simulator
+			port, err := freePort()
+			require.NoError(t, err)
+			table, teardown := prepareSimulator(t, port)
+			defer teardown()
+			tt.prepare(simsql.NewEmptyContext(), table)
+
+			// run
+			db, err := NewClient(port)
+			require.NoError(t, err)
+			r := NewUserRepository(db)
+			actual, err := r.Get(context.TODO(), tt.id)
+
+			// assert
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+func freePort() (int, error) {
+	// NOTE: free port are chosen if port 0 is specified
+	l, err := net.Listen("tcp4", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	// close connection to use later
+	l.Close()
+	addr := l.Addr().(*net.TCPAddr)
+	return addr.Port, nil
+}
+
+func prepareSimulator(t *testing.T, port int) (*memory.Table, func()) {
+	db, table := simulatorDB()
+
+	engine := sqle.NewDefault(
+		simsql.NewDatabaseProvider(
+			db,
+			information_schema.NewInformationSchemaDatabase(),
+		))
+	engine.Analyzer.Catalog.MySQLDb.AddSuperUser("root", "localhost", "")
+
+	config := server.Config{
+		Protocol: "tcp",
+		Address:  fmt.Sprintf("localhost:%d", port),
+	}
+	s, err := server.NewDefaultServer(config, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		if err = s.Start(); err != nil {
+			panic(err)
+		}
+	}()
+
+	teardown := func() {
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return table, teardown
+}
+
+func simulatorDB() (*memory.Database, *memory.Table) {
+	db := memory.NewDatabase("practice")
+
+	tableName := "user"
+	table := memory.NewTable(tableName, simsql.NewPrimaryKeySchema(simsql.Schema{
+		{Name: "id", Type: simsql.Text, Nullable: false, Source: tableName, PrimaryKey: true},
+		{Name: "name", Type: simsql.Text, Nullable: false, Source: tableName},
+		{Name: "age", Type: simsql.Int64, Nullable: false, Source: tableName},
+	}), db.GetForeignKeyCollection())
+	db.AddTable(tableName, table)
+
+	return db, table
 }
